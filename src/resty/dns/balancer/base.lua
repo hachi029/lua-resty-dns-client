@@ -149,7 +149,7 @@ local SRV_0_WEIGHT = 1      -- SRV record with weight 0 should be hit minimally,
 local dns_client = require "resty.dns.client"
 local dns_utils = require "resty.dns.utils"
 local dns_handle = require "resty.dns.balancer.handle"
-local resty_timer = require "resty.timer"
+local resty_timer = require "resty.timer"   -- https://github.com/Kong/lua-resty-timer
 local time = ngx.now
 local table_sort = table.sort
 local table_remove = table.remove
@@ -221,7 +221,8 @@ function objAddr:getPeer(cacheOnly)
     return nil, errors.ERR_DNS_UPDATED
   end
 
-  if self.ipType == "name" then
+  --- 如果dns解析记录ttl为0， ipType="name", 在每次getPeer时都会执行dns解析
+  if self.ipType == "name" then   --- ipType在 newAddress时初始化，可能是 'ipv4', 'ipv6' or 'name'
     -- SRV type record with a named target
     local ip, port, try_list = self.host.balancer.dns.toip(self.ip, self.port, cacheOnly)
     if not ip then
@@ -238,6 +239,7 @@ end
 -- disables an address object from the balancer.
 -- It will set its weight to 0, and the `disabled` flag to `true`.
 -- @see delete
+--- 将当前address的权重改为0， disabled标记为true
 function objAddr:disable()
   ngx_log(ngx_DEBUG, self.log_prefix, "disabling address: ", self.ip, ":", self.port,
           " (host ", (self.host or EMPTY).hostname, ")")
@@ -255,6 +257,7 @@ function objAddr:delete()
   ngx_log(ngx_DEBUG, self.log_prefix, "deleting address: ", self.ip, ":", self.port,
           " (host ", (self.host or EMPTY).hostname, ")")
 
+  -- 调用callback触发事件
   self.host.balancer:callback("removed", self, self.ip,
                               self.port, self.host.hostname, self.hostHeader)
   self.host.balancer:removeAddress(self)
@@ -381,13 +384,14 @@ end
 
 -- define sort order for DNS query results
 local sortQuery = function(a,b) return a.__balancerSortKey < b.__balancerSortKey end
+--- 一系列排序函数，不同的dns记录类型比较逻辑不一样
 local sorts = {
   [dns_client.TYPE_A] = function(result)
     local sorted = {}
     -- build table with keys
     for i, v in ipairs(result) do
       sorted[i] = v
-      v.__balancerSortKey = v.address
+      v.__balancerSortKey = v.address   -- 比较的关键字
     end
     -- sort by the keys
     table_sort(sorted, sortQuery)
@@ -418,6 +422,8 @@ sorts = setmetatable(sorts,{
   })
 
 local atomic_tracker = setmetatable({},{ __mode = "k" })
+
+--保证只有一个f的执行实例，使用self.balancer作为key
 local function assert_atomicity(f, self, ...)
   -- if the following assertion failed, then the function probably yielded and
   -- allowed other threads to enter simultaneously.
@@ -439,6 +445,7 @@ local function resolve_timer_callback()
   local now = time()
   --print("running timer:",tostring(renewal_heap:peekValue()), " ", now)
 
+  -- 从renewal_heap中取出需要被更新DNS的记录
   while (renewal_heap:peekValue() or math.huge) < now do
     local key = renewal_heap:pop()
     local host = renewal_weak_cache[key] -- can return nil if GC'ed
@@ -489,14 +496,14 @@ local function cancel_dns_renewal(host)
   renewal_heap:remove(key)
 end
 
-
+-- 根据dns解析结果，更新host的address
 local function update_dns_result(self, newQuery, dns)
   local oldQuery = self.lastQuery or {}
   local oldSorted = self.lastSorted or {}
 
   -- we're using the dns' own cache to check for changes.
   -- if our previous result is the same table as the current result, then nothing changed
-  if oldQuery == newQuery then
+  if oldQuery == newQuery then    ---1.和上次解析结果相同
     ngx_log(ngx_DEBUG, self.log_prefix, "no dns changes detected for ", self.hostname)
 
     return true    -- exit, nothing changed
@@ -507,17 +514,17 @@ local function update_dns_result(self, newQuery, dns)
   -- So if we get a ttl=0 twice in a row (the old one, and the new one), we update it. And
   -- if the very first request ever reports ttl=0 (we assume we're not hitting the edgecase
   -- in that case)
-  if (newQuery[1] or EMPTY).ttl == 0 and
+  if (newQuery[1] or EMPTY).ttl == 0 and    ---2. ttl为0
      (((oldQuery[1] or EMPTY).ttl or 0) == 0 or oldQuery.__ttl0Flag) then
-    -- ttl = 0 means we need to lookup on every request.
+    --- ttl = 0 means we need to lookup on every request.
     -- To enable lookup on each request we 'abuse' a virtual SRV record. We set the ttl
-    -- to `ttl0Interval` seconds, and set the `target` field to the hostname that needs
-    -- resolving. Now `getPeer` will resolve on each request if the target is not an IP address,
-    -- and after `ttl0Interval` seconds we'll retry to see whether the ttl has changed to non-0.
+    --- to `ttl0Interval` seconds, and set the `target` field to the hostname that needs
+    --- resolving. Now `getPeer` will resolve on each request if the target is not an IP address,
+    --- and after `ttl0Interval` seconds we'll retry to see whether the ttl has changed to non-0.
     -- Note: if the original record is an SRV we cannot use the dns provided weights,
     -- because we can/are not going to possibly change weights on each request
     -- so we fix them at the `nodeWeight` property, as with A and AAAA records.
-    if oldQuery.__ttl0Flag then
+    if oldQuery.__ttl0Flag then           ---2.1 处理边界条件
       -- still ttl 0 so nothing changed
       oldQuery.touched = time()
       oldQuery.expire = oldQuery.touched + self.balancer.ttl0Interval
@@ -528,10 +535,11 @@ local function update_dns_result(self, newQuery, dns)
 
     ngx_log(ngx_DEBUG, self.log_prefix, "ttl=0 detected for ",
             self.hostname)
+    --- 2.2 ttl=0,使用一个虚拟的记录.在每次request时，getPeer里会重新执行DNS解析
     newQuery = {
         {
           type = dns.TYPE_SRV,
-          target = self.hostname,
+          target = self.hostname,   --不是一个ip
           name = self.hostname,
           port = self.port,
           weight = self.nodeWeight,
@@ -554,13 +562,14 @@ local function update_dns_result(self, newQuery, dns)
               self.hostname, ", assuming A-record")
     rtype = dns.TYPE_A
   end
-  local newSorted = sorts[rtype](newQuery)
+  local newSorted = sorts[rtype](newQuery)  --根据不同的记录类型执行不同的排序逻辑
   local dirty
 
-  if rtype ~= (oldSorted[1] or EMPTY).type then
+  if rtype ~= (oldSorted[1] or EMPTY).type then ---3.新解析结果与本次解析结果记录类型不一样
     -- DNS recordtype changed; recycle everything
     ngx_log(ngx_DEBUG, self.log_prefix, "dns record type changed for ",
             self.hostname, ", ", (oldSorted[1] or EMPTY).type, " -> ",rtype)
+    ---3.1 重新build当前host
     for i = #oldSorted, 1, -1 do  -- reverse order because we're deleting items
       self:disableAddress(oldSorted[i])
     end
@@ -568,7 +577,7 @@ local function update_dns_result(self, newQuery, dns)
       self:addAddress(entry)
     end
     dirty = true
-  else
+  else                                       ---4.新解析结果与本次解析结果仅记录不同
     -- new record, but the same type
     local topPriority = (newSorted[1] or EMPTY).priority -- nil for non-SRV records
     local done = {}
@@ -578,22 +587,22 @@ local function update_dns_result(self, newQuery, dns)
 
       local key = newEntry.__balancerSortKey
       local oldEntry = oldSorted[oldSorted[key] or "__key_not_found__"]
-      if not oldEntry then
+      if not oldEntry then    --- 4.1新的address
         -- it's a new entry
         ngx_log(ngx_DEBUG, self.log_prefix, "new dns record entry for ",
                 self.hostname, ": ", (newEntry.target or newEntry.address),
                 ":", newEntry.port) -- port = nil for A or AAAA records
         self:addAddress(newEntry)
         dirty = true
-      else
+      else                   --- 4.2 已存在
         -- it already existed (same ip, port)
         if newEntry.weight and
-           newEntry.weight ~= oldEntry.weight and
+           newEntry.weight ~= oldEntry.weight and   --- 4.2.1 weight变化了，更新weight
            not (newEntry.weight == 0  and oldEntry.weight == SRV_0_WEIGHT) then
           -- weight changed (can only be an SRV)
           self:findAddress(oldEntry):change(newEntry.weight == 0 and SRV_0_WEIGHT or newEntry.weight)
           dirty = true
-        else
+        else                                        --- 4.2.2 无变化
           ngx_log(ngx_DEBUG, self.log_prefix, "unchanged dns record entry for ",
                   self.hostname, ": ", (newEntry.target or newEntry.address),
                   ":", newEntry.port) -- port = nil for A or AAAA records
@@ -602,7 +611,7 @@ local function update_dns_result(self, newQuery, dns)
         dCount = dCount + 1
       end
     end
-    if dCount ~= #oldSorted then
+    if dCount ~= #oldSorted then      --- 5. 有需要删除的记录
       -- not all existing entries were handled, remove the ones that are not in the
       -- new query result
       for _, entry in ipairs(oldSorted) do
@@ -610,7 +619,7 @@ local function update_dns_result(self, newQuery, dns)
           ngx_log(ngx_DEBUG, self.log_prefix, "removed dns record entry for ",
                   self.hostname, ": ", (entry.target or entry.address),
                   ":", entry.port) -- port = nil for A or AAAA records
-          self:disableAddress(entry)
+          self:disableAddress(entry)    ---5.1 标记为disabled, 在后续的deleteAddresses中会进行删除
         end
       end
       dirty = true
@@ -620,17 +629,17 @@ local function update_dns_result(self, newQuery, dns)
   self.lastQuery = newQuery
   self.lastSorted = newSorted
 
-  if dirty then
+  if dirty then       --- 6. address发生了变更
     -- above we already added and updated records. Removed addresses are disabled, and
     -- need yet to be deleted from the Host
     ngx_log(ngx_DEBUG, self.log_prefix, "updating balancer based on dns changes for ",
             self.hostname)
 
     -- allow balancer to update its algorithm
-    self.balancer:afterHostUpdate(self)
+    self.balancer:afterHostUpdate(self)     --- 6.1 更新状态
 
     -- delete addresses previously disabled
-    self:deleteAddresses()
+    self:deleteAddresses()                  ---6.2  删除被disable的address
   end
 
   ngx_log(ngx_DEBUG, self.log_prefix, "querying dns and updating for ", self.hostname, " completed")
@@ -668,9 +677,9 @@ function objHost:queryDns(cacheOnly)
     }
   end
 
-  assert_atomicity(update_dns_result, self, newQuery, dns)
+  assert_atomicity(update_dns_result, self, newQuery, dns)    --原子执行
 
-  schedule_dns_renewal(self)
+  schedule_dns_renewal(self)    --加入dns更新任务列表，根据下次dns更新时间，放入renewal_heap中
 
   return true
 end
@@ -696,10 +705,11 @@ function objHost:change(newWeight)
   local dirty = false
   self.nodeWeight = newWeight
   local lastQuery = self.lastQuery or {}
-  if #lastQuery > 0 then
+  if #lastQuery > 0 then    --- lastQuery是上一次成功执行DNS查询的结果
     if lastQuery[1].type == dns_client.TYPE_SRV and not lastQuery.__ttl0Flag then
       -- this is an SRV record (and not a fake ttl=0 one), which
       -- carries its own weight setting, so nothing to update
+      --- 忽略srv记录的 newWeight
       ngx_log(ngx_DEBUG, self.log_prefix, "ignoring weight change for ", self.hostname,
               " as SRV records carry their own weight")
     else
@@ -754,7 +764,7 @@ end
 function objHost:disableAddress(entry)
   local addr = self:findAddress(entry)
   if addr and not addr.disabled then
-    addr:disable()
+    addr:disable()    --标记disable
   end
   return addr
 end
@@ -764,8 +774,8 @@ end
 function objHost:deleteAddresses()
   for i = #self.addresses, 1, -1 do -- deleting entries, hence reverse traversal
     if self.addresses[i].disabled then
-      self.addresses[i]:delete()
-      table_remove(self.addresses, i)
+      self.addresses[i]:delete()      --调用objBalancer相关方法，触发事件
+      table_remove(self.addresses, i) --从self.addresses中移除
     end
   end
 
@@ -775,10 +785,11 @@ end
 -- disables a host, by setting all adressess to 0
 -- Host can only be deleted after updating the balancer algorithm!
 -- @return true
+---host disable，将其所有的address也disabled
 function objHost:disable()
   -- set weights to 0
   for _, addr in ipairs(self.addresses) do
-    addr:disable()
+    addr:disable()    -- 将当前address的权重改为0， disabled标记为true
   end
 
   return true
@@ -800,7 +811,7 @@ function objHost:delete()
   self.lastSorted = nil
 end
 
-
+--- 查看当前dns解析记录是否已过期，如果已过期，触发一个dns查询请求
 function objHost:addressStillValid(cacheOnly, address)
 
   if ((self.lastQuery or EMPTY).expire or 0) < time() and not cacheOnly then
@@ -865,7 +876,7 @@ function objHost:getStatus()
   return status
 end
 
-
+--- 仅用于内部调用，非外部可用函数
 --- Creates a new host object. There is no need to call this from user code.
 -- When implementing a new balancer algorithm, you might want to override this method.
 -- The `host` table should have fields:
@@ -893,7 +904,7 @@ function objBalancer:newHost(host)
   host.log_prefix = host.balancer.log_prefix
   host.weight = 0            -- overall weight of all addresses within this hostname
   host.unavailableWeight = 0 -- overall weight of unavailable addresses within this hostname
-  host.lastQuery = nil       -- last successful dns query performed
+  host.lastQuery = nil       -- last successful dns query performed 上次DNS解析结果
   host.lastSorted = nil      -- last successful dns query, sorted for comparison
   host.addresses = {}        -- list of addresses (address objects) this host resolves to
   host.expire = nil          -- time when the dns query this host is based upon expires
@@ -904,11 +915,12 @@ function objBalancer:newHost(host)
   -- This should actually be a responsibility of the balancer object, but in
   -- this case we do it here, because it is needed before we can redistribute
   -- the indices in the queryDns method just below.
+  --- 将自己加入balancer的hosts中
   host.balancer.hosts[#host.balancer.hosts + 1] = host
 
   ngx_log(ngx_DEBUG, host.balancer.log_prefix, "created a new host for: ", host.hostname)
 
-  host:queryDns()
+  host:queryDns()   -- 进行dns解析，并将结果添加到host的address中，发布相关事件
 
   return host
 end
@@ -981,39 +993,41 @@ end
 -- taken from the SRV record.
 -- @return balancer object, or throw an error on bad input
 -- @within User properties
+--- 一个hostname可能会被解析成多个address（ip:port）. nodeWeight必须>=1.
+--- 如果host被解析为多个address，则每个address的权重都为nodeWeight。每个address的权重会增加到host.weight和balancer.weight上
 function objBalancer:addHost(hostname, port, nodeWeight)
   assert(type(hostname) == "string", "expected a hostname (string), got "..tostring(hostname))
-  port = port or DEFAULT_PORT
-  nodeWeight = nodeWeight or DEFAULT_WEIGHT
+  port = port or DEFAULT_PORT   --默认80
+  nodeWeight = nodeWeight or DEFAULT_WEIGHT --默认10
   assert(type(nodeWeight) == "number" and
          math_floor(nodeWeight) == nodeWeight and
          nodeWeight >= 1,
          "Expected 'weight' to be an integer >= 1; got "..tostring(nodeWeight))
 
-  local host
+  local host  ---1.查找是否已经被添加过了
   for _, host_entry in ipairs(self.hosts) do
     if host_entry.hostname == hostname and host_entry.port == port then
       -- found it
-      host = host_entry
+      host = host_entry   ---1.1 找到
       break
     end
   end
 
-  if not host then
+  if not host then    ---2.未添加过
     -- create the new host, that will insert itself in the balancer
-    self:newHost {
+    self:newHost {    ---2.1 会解析dns, 将dns解析结果加入balancer
       hostname = hostname,
       port = port,
       nodeWeight = nodeWeight,
       balancer = self
     }
-  else
+  else              ---3.已经添加过了
     -- this one already exists, update if different
     ngx_log(ngx_DEBUG, self.log_prefix, "host ", hostname, ":", port,
             " already exists, updating weight ",
             host.nodeWeight, "-> ",nodeWeight)
 
-    if host.nodeWeight ~= nodeWeight then
+    if host.nodeWeight ~= nodeWeight then   --- 3.1如果和已有的nodeWeight不一样，则更新nodeWeight
       -- weight changed, go update
       local dirty = host:change(nodeWeight)
       if dirty then
@@ -1124,6 +1138,7 @@ function objBalancer:updateStatus()
     return -- no status change
   end
 
+  -- 发布balancer状态变更事件
   self:callback("health", self.healthy)
 end
 
@@ -1255,7 +1270,7 @@ end
 -- @within User properties
 function objBalancer:setAddressStatus(available, ip_address_handle, port, hostname)
 
-  if type(ip_address_handle) == "table" then
+  if type(ip_address_handle) == "table" then   --- 1.如果是handler
     -- it's not an IP
     if ip_address_handle.address then
       -- it's a handle from `setPeer`.
@@ -1268,15 +1283,15 @@ function objBalancer:setAddressStatus(available, ip_address_handle, port, hostna
   end
 
   -- no handle, so go and search for it
-  hostname = hostname or ip_address_handle
+  hostname = hostname or ip_address_handle     ---2.是一个ip 或域名
   local name_srv = {}
-  for _, addr, host in self:addressIter() do
+  for _, addr, host in self:addressIter() do   ---2.1 遍历找到要设置状态的address
     if host.hostname == hostname and addr.port == port then
       if addr.ip == ip_address_handle then
         -- found it
-        addr:setState(available)
+        addr:setState(available)              --- 会改变address.available
         return true
-      elseif addr.ipType == "name" then
+      elseif addr.ipType == "name" then       ---2.2 是一个域名
         -- so.... the ip is a name. This means that the host that
         -- was added most likely resolved to an SRV, which then has
         -- in turn names as targets instead of ip addresses.
@@ -1431,7 +1446,6 @@ function objBalancer:getStatus()
 end
 
 --- Creates a new base balancer.
---
 -- A single balancer can hold multiple hosts. A host can be an ip address or a
 -- name. As such each host can have multiple addresses (or actual ip+port
 -- combinations).
@@ -1444,7 +1458,7 @@ end
 -- - `ttl0` (optional) Maximum lifetime for records inserted with `ttl=0`, to verify
 -- the ttl is still 0. Defaults to 60 if omitted (in seconds)
 -- - `callback` (optional) a function called when an address is added/changed. See
--- `setCallback` for details.
+-- `setCallback` for details.   -- 当address添加或删除的回调
 -- - `log_prefix` (optional) a name used in the prefix for log messages. Defaults to
 -- `"balancer"` which results in log prefix `"[balancer 1]"` (the number is a sequential
 -- id number)
@@ -1458,6 +1472,9 @@ end
 -- @param opts table with options
 -- @return new balancer object or nil+error
 -- @within User properties
+--- removeHost--->balancer减掉相应weigh---->更新availableWeigh--->availableWeigh比重小于healthThreshold
+--- 变为unhealthy
+--- 一个balancer可以添加多个hosts，一个host可以解析出多个address(ip:port)
 _M.new = function(opts)
   assert(type(opts) == "table", "Expected an options table, but got: "..type(opts))
   assert(opts.dns, "expected option `dns` to be a configured dns client")
@@ -1470,7 +1487,7 @@ _M.new = function(opts)
   assert((opts.healthThreshold or 1) >= 0 and (opts.healthThreshold or 1) <= 100,
     "expected 'healthThreshold' to be in the range 0-100, but got: " .. tostring(opts.healthThreshold))
 
-  balancer_id_counter = balancer_id_counter + 1
+  balancer_id_counter = balancer_id_counter + 1   --每次创建一个balancer时，加1
   local self = {
     -- properties
     id = balancer_id_counter,
@@ -1487,7 +1504,7 @@ _M.new = function(opts)
     healthThreshold = opts.healthThreshold or 0, -- % healthy weight for overall balancer health
     useSRVname = not not opts.useSRVname, -- force to boolean
   }
-  self = setmetatable(self, mt_objBalancer)
+  self = setmetatable(self, mt_objBalancer)   --__index=objBalancer
   self.super = objBalancer
 
   self:setCallback(opts.callback or function() end) -- callback for address mutations
@@ -1498,8 +1515,8 @@ end
 
 -- start global renewal timer
 renewal_timer = assert(resty_timer({
-  recurring = true,
-  interval = 1,
+  recurring = true,   -- recurring or single timer
+  interval = 1,       -- expiry interval in seconds
   detached = false, -- not anchored, so reloading GC's timer for test purposes
   expire = resolve_timer_callback,
 }))

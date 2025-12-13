@@ -116,7 +116,7 @@ function lc:getPeer(cacheOnly, handle, hashValue)
 
   local address, ip, port, host
   while true do
-    if not self.healthy then
+    if not self.healthy then    --- balancer本身不健康
       -- Balancer unhealthy, nothing we can do.
       -- This check must be inside the loop, since calling getPeer could
       -- cause a DNS update.
@@ -137,7 +137,7 @@ function lc:getPeer(cacheOnly, handle, hashValue)
           self.binaryHeap:pop()
         end
         address = self.binaryHeap:peek()
-      until address == nil or not (handle.failedAddresses or EMPTY)[address]
+      until address == nil or not (handle.failedAddresses or EMPTY)[address]    ---找到一个可用的address
 
       if address == nil and handle.failedAddresses then
         -- we failed all addresses, so drop the list of failed ones, we are trying

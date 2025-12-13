@@ -1,7 +1,7 @@
 --------------------------------------------------------------------------
 -- DNS client.
 --
--- Works with OpenResty only. Requires the [`lua-resty-dns`](https://github.com/openresty/lua-resty-dns) module.
+--- Works with OpenResty only. Requires the [`lua-resty-dns`](https://github.com/openresty/lua-resty-dns) module.
 --
 -- _NOTES_:
 --
@@ -24,7 +24,7 @@ local utils = require("resty.dns.utils")
 local fileexists = require("pl.path").exists
 local semaphore = require("ngx.semaphore").new
 local lrucache = require("resty.lrucache")
-local resolver = require("resty.dns.resolver")
+local resolver = require("resty.dns.resolver")  --https://github.com/openresty/lua-resty-dns
 local deepcopy = require("pl.tablex").deepcopy
 local time = ngx.now
 local log = ngx.log
@@ -437,8 +437,8 @@ local poolMaxRetry
 -- noSynchronisation = false
 --
 -- assert(client.init({
---          hosts = hosts,
---          resolvConf = resolvConf,
+--          hosts = hosts,  可以是文件名/etc/hosts 或是文件内容的table
+--          resolvConf = resolvConf,  可以是文件名/etc/resolv.conf 或是文件内容的table
 --          ndots = ndots,
 --          no_random = no_random,
 --          search = search,
@@ -451,6 +451,7 @@ local poolMaxRetry
 --          noSynchronisation = noSynchronisation,
 --        })
 -- )
+--- 初始化dns客户端, 基于Openresty的lua-resty-dns DNS解析功能，增加了cache层
 _M.init = function(options)
 
   log(DEBUG, PREFIX, "(re)configuring dns client")
@@ -460,6 +461,7 @@ _M.init = function(options)
   staleTtl = options.staleTtl or 4
   log(DEBUG, PREFIX, "staleTtl = ", staleTtl)
 
+  --- 缓存数量
   cacheSize = options.cacheSize or 10000  -- default set here to be able to reset the cache
   noSynchronisation = options.noSynchronisation
   log(DEBUG, PREFIX, "noSynchronisation = ", tostring(noSynchronisation))
@@ -806,7 +808,7 @@ end
 -- @return `result + nil + try_list`, or `nil + err + try_list` in case of errors
 local function syncQuery(qname, r_opts, try_list, count)
   local key = qname..":"..r_opts.qtype
-  local item = queue[key]
+  local item = queue[key]   --查看是否有正在执行中的查询
   count = count or 1
 
   -- if nothing is in progress, we start a new async query
@@ -1121,6 +1123,7 @@ end
 -- @param dnsCacheOnly Only check the cache, won't do server lookups
 -- @param try_list (optional) list of tries to add to
 -- @return `list of records + nil + try_list`, or `nil + err + try_list`.
+--- try_list 记录查询过程中尝试的记录， 如查询缓存、查询cname
 local function resolve(qname, r_opts, dnsCacheOnly, try_list)
   qname = string_lower(qname)
   local qtype = (r_opts or EMPTY).qtype
@@ -1139,7 +1142,7 @@ local function resolve(qname, r_opts, dnsCacheOnly, try_list)
   -- we do this only to prevent iterating over the SEARCH directive and
   -- potentially requerying failed lookups in that process as the ttl for
   -- errors is relatively short (1 second default)
-  records = cacheShortLookup(qname, qtype)
+  records = cacheShortLookup(qname, qtype)    ---1. 从dnscache中查询
   if records then
     if try_list then
       -- check for recursion
@@ -1180,7 +1183,7 @@ local function resolve(qname, r_opts, dnsCacheOnly, try_list)
 
   -- check for qname being an ip address
   local name_type = utils.hostnameType(qname)
-  if name_type ~= "name" then
+  if name_type ~= "name" then       --- 2. 查询的不是一个域名，是一个ipv4或ipv6
     if name_type == "ipv4" then
       -- if no qtype is given, we're supposed to search, so forcing TYPE_A is safe
       records, _, try_list = check_ipv4(qname, qtype or _M.TYPE_A, try_list)
@@ -1555,6 +1558,7 @@ local function setpeername(sock, host, port)
   return sock:connect(targetIp, targetPort)
 end
 
+--- dns客户端
 -- export local functions
 _M.resolve = resolve
 _M.toip = toip

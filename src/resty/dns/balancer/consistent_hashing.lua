@@ -3,7 +3,7 @@
 --
 -- This balancer implements a consistent-hashing algorithm based on the
 -- Ketama algorithm.
---
+--- 可以保证不同网关节点构建出来的balancer实例是相同的。避免相同的请求，不同的网关节点将请求转发到不同的后端实例。
 -- This load balancer is designed to make sure that every time a load
 -- balancer object is built, it is built the same, no matter the order the
 -- process is done.
@@ -101,17 +101,17 @@ end
 -- This function makes sure the continuum will be built identically every
 -- time, no matter the order the hosts are added.
 function consistent_hashing:afterHostUpdate(host)
-  local points = self.points
-  local new_continuum = {}
+  local points = self.points     --- 是创建balancer时传入的opts.wheelSize
+  local new_continuum = {}      --重新构建new_continuum
   local total_weight = self.weight
   local host_count = #self.hosts
   local total_collision = 0
 
-  sort_hosts_and_addresses(self)
+  sort_hosts_and_addresses(self)      --字面值排序
 
-  for weight, address, h in self:addressIter() do
-    local addr_prop = weight / total_weight
-    local entries = floor(addr_prop * host_count * SERVER_POINTS)
+  for weight, address, h in self:addressIter() do     ---遍历每个address
+    local addr_prop = weight / total_weight     ---当前address占总权重的比例
+    local entries = floor(addr_prop * host_count * SERVER_POINTS) --- 当前host应该分配的entries数量
     if weight > 0 and entries == 0 then
       entries = 1 -- every address with weight > 0 must have at least one entry
     end
@@ -119,15 +119,15 @@ function consistent_hashing:afterHostUpdate(host)
     local i = 1
     while i <= entries do
       local name = tostring(address.ip) .. ":" .. port .. SEP .. tostring(i)
-      local index = get_continuum_index(name, points)
-      if new_continuum[index] == nil then
+      local index = get_continuum_index(name, points)   ---hash name后按points取模
+      if new_continuum[index] == nil then   ---放置一个点
         new_continuum[index] = address
       else
-        entries = entries + 1 -- move the problem forward
+        entries = entries + 1 -- move the problem forward   --- 放置失败
         total_collision = total_collision + 1
       end
       i = i + 1
-      if i > self.points then
+      if i > self.points then   --- 已经尝试过new_continuum中所有的位置了
         -- this should happen only if there are an awful amount of hosts with
         -- low relative weight.
         ngx_log(ngx_CRIT, "consistent hashing balancer requires more entries ",
@@ -141,7 +141,7 @@ function consistent_hashing:afterHostUpdate(host)
   ngx_log(ngx_DEBUG, self.log_prefix, "continuum of size ", self.points,
           " updated with ", total_collision, " collisions")
 
-  self.continuum = new_continuum
+  self.continuum = new_continuum    ---更新continuum
 
 end
 
@@ -189,7 +189,7 @@ function consistent_hashing:getPeer(cacheOnly, handle, valueToHash)
     end
 
     address = self.continuum[index]
-    if address ~= nil and address.available and not address.disabled then
+    if address ~= nil and address.available and not address.disabled then     ---过滤掉unavailable和disabled
       ip, port, hostname = address:getPeer(cacheOnly)
       if ip then
         -- success, update handle

@@ -68,8 +68,13 @@ _M.MAXSEARCH = 6
 -- print(lookup["localhost"])         --> "127.0.0.1"
 -- print(lookup["ftp.computer.com"])  --> "192.168.1.3" note: name in lowercase!
 -- print(lookup["alias1"])            --> "192.168.1.3"
+--解析/etc/hosts, 结果为 ip-->name or name ---> ip
+--- 127.0.0.1  localhost lo
+--- 255.255.255.255	broadcasthost
+--->result: {{"localhost","lo", family="ipv4", ip=127.0.0.1}, {"broadcasthost", family="ipv4", ip=255.255.255.255}}
+  --->reverse: {localhost={ipv4=""127.0.0.1}, lo={ipv4=""127.0.0.1, ipv6=""}, broadcasthost={ipv4=""127.0.0.1}}
 _M.parseHosts = function(filename)
-  local lines
+  local lines   -- 文件内容
   if type(filename) == "table" then
     lines = filename
   else
@@ -149,6 +154,10 @@ end
 -- @return a table with fields `nameserver` (table), `domain` (string), `search` (table),
 -- `sortlist` (table) and `options` (table)
 -- @see applyEnv
+--- 解析/etc/resolve.conf
+--- nameserver 1.1.1.1
+--- nameserver 1.1.1.2    ----->  {nameserver={"1.1.1.1 ","1.1.1.2"}, options = {timeout=2}}
+--- options timeout:2
 _M.parseResolvConf = function(filename)
   local lines
   if type(filename) == "table" then
@@ -211,6 +220,7 @@ end
 --
 -- -- Is identical to;
 -- local config, err = utils.applyEnv(utils.parseResolvConf())
+--- 解析LOCALDOMAIN和RES_OPTIONS两个环境变量，结果合入parseResolvConf(/etc/resolv.conf)返回的表里
 _M.applyEnv = function(config, err)
   if not config then return config, err end -- allow for 'nil+error' pass-through
   local localdomain = os.getenv("LOCALDOMAIN") or ""
@@ -250,6 +260,7 @@ local ttlHosts   -- time to live for cache
 -- @param ttl cache time-to-live in seconds (can be updated in following calls)
 -- @return reverse and list tables, same as `parseHosts`.
 -- @see parseHosts
+--- 获取/etc/hosts解析结果。如果上次解析时间距离现在超过ttl, 则重新解析/etc/hosts
 _M.getHosts = function(ttl)
   ttlHosts = ttl or ttlHosts
   local now = time()
@@ -279,6 +290,7 @@ local ttlResolv   -- time to live for cache
 -- @param ttl cache time-to-live in seconds (can be updated in following calls)
 -- @return configuration table, same as `parseResolveConf`.
 -- @see parseResolvConf
+--- 获取/etc/resolve.conf解析结果。如果上次解析时间距离现在超过ttl, 则重新解析/etc/resolv.conf
 _M.getResolv = function(ttl)
   ttlResolv = ttl or ttlResolv
   local now = time()
@@ -307,6 +319,7 @@ end
 -- hostnameType("::1")              -->  "ipv6"
 -- hostnameType("[::1]:8000")       -->  "ipv6"
 -- hostnameType("some::thing")      -->  "ipv6", but invalid...
+--- 工具方法：返回name的类型 ipv4 or ipv6 or name
 _M.hostnameType = function(name)
   local remainder, colons = gsub(name, ":", "")
   if colons > 1 then return "ipv6" end
@@ -319,8 +332,9 @@ end
 -- square brackets, even if the input wasn't.
 -- @param name the string to check (this may contain a port number)
 -- @return `name/ip` + `port (or nil)` + `type` (one of: `"ipv4"`, `"ipv6"`, or `"name"`)
+--- 工具方法：ip:port字符串 解析出ip和port
 _M.parseHostname = function(name)
-  local t = _M.hostnameType(name)
+  local t = _M.hostnameType(name)   -- ipv4 or ipv6 or name
   if t == "ipv4" or t == "name" then
     local ip, port = name:match("^([^:]+)%:*(%d*)$")
     return ip, tonumber(port), t

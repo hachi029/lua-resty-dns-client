@@ -12,7 +12,11 @@
 -- @copyright 2016-2020 Kong Inc. All rights reserved.
 -- @license Apache 2.0
 
-
+--- handles are used to retain state between consecutive invocations
+---(calls to the objBalancer:getPeer method).
+---The handles are re-used and tracked for garbage collection. There are two uses:
+--- 1. tracking progress (eg. keeping a retry count)
+--- 2. tracking resources (eg. with least connections a handle 'owns' 1 connection, to be released when the connection is finished)
 local table_new = require "table.new"
 local table_clear = require "table.clear"
 local EMPTY = setmetatable({},

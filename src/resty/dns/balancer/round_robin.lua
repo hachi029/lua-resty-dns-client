@@ -40,18 +40,18 @@ end
 
 
 function roundrobin_balancer:afterHostUpdate(host)
-  local new_wheel = {}
+  local new_wheel = {}    --每次host变更，重新构建wheel
   local total_points = 0
   local total_weight = 0
   local addr_count = 0
   local divisor = 0
 
   -- calculate the gcd to find the proportional weight of each address
-  for _, host in ipairs(self.hosts) do
-    for _, address in ipairs(host.addresses) do
+  for _, host in ipairs(self.hosts) do        --- 遍历每个host
+    for _, address in ipairs(host.addresses) do   --- 对于host的每个address
       addr_count = addr_count + 1
       local address_weight = address.weight
-      divisor = gcd(divisor, address_weight)
+      divisor = gcd(divisor, address_weight)      --计算最大公约数
       total_weight = total_weight + address_weight
     end
   end
@@ -61,34 +61,39 @@ function roundrobin_balancer:afterHostUpdate(host)
     return
   end
 
-  if divisor > 0 then
+  --- 例如 10 30 50 ， total_weight = 90, total_points=9 , 每个address的points = 1, 3, 5
+  if divisor > 0 then     --- total_points = 所有weight之和/所有weight最大公约数
     total_points = total_weight / divisor
   end
 
   -- add all addresses to the wheel
   for _, host in ipairs(self.hosts) do
     for _, address in ipairs(host.addresses) do
-      local address_points = address.weight / divisor
-      for _ = 1, address_points do
+      local address_points = address.weight / divisor     ---计算每个address的points
+      for _ = 1, address_points do                        --- 在new_wheel中相应地有points个point
         new_wheel[#new_wheel + 1] = address
       end
     end
   end
 
   -- store the shuffled wheel
-  self.wheel = wheel_shuffle(new_wheel)
+  self.wheel = wheel_shuffle(new_wheel)   --- 打乱顺序
   self.wheelSize = total_points
   self.weight = total_weight
 
 end
 
-
+--- 关键结构：self.wheel : {add1, add2, add1, add2, add3}   按address权重创建的address数组
+--- self.wheelSize wheel数组长度
+--- self.pointer 一个wheel的索引指针。
+--- 算法：根据权重计算wheel数组里每个address应该放置的个数.(total_weight/divisor)，然后将wheel数组随机打乱
+---      每次getPeer时，从self.pointer开始，依次取address
 function roundrobin_balancer:getPeer(cacheOnly, handle, hashValue)
-  if not self.healthy then
+  if not self.healthy then    --- 1. 当前balancer已不健康（不健康实例占比超过阈值）
     return nil, balancer_base.errors.ERR_BALANCER_UNHEALTHY
   end
 
-  if handle then
+  if handle then    --- handler是一个上下文
     -- existing handle, so it's a retry
     handle.retryCount = handle.retryCount + 1
   else
@@ -97,7 +102,7 @@ function roundrobin_balancer:getPeer(cacheOnly, handle, hashValue)
     handle.retryCount = 0
   end
 
-  local starting_pointer = self.pointer
+  local starting_pointer = self.pointer   --- 从上次结束的位置开始
   local address
   local ip, port, hostname
   repeat
@@ -108,6 +113,7 @@ function roundrobin_balancer:getPeer(cacheOnly, handle, hashValue)
     end
 
     address = self.wheel[self.pointer]
+    --- 如果当前address健康，且未被disabled
     if address ~= nil and address.available and not address.disabled then
       ip, port, hostname = address:getPeer(cacheOnly)
       if ip then
@@ -135,7 +141,8 @@ function roundrobin_balancer:getPeer(cacheOnly, handle, hashValue)
   return nil, balancer_base.errors.ERR_NO_PEERS_AVAILABLE
 end
 
-
+--- 1. 创建balancer_base
+--- 2. 执行balancer_base.addHost
 function _M.new(opts)
   assert(type(opts) == "table", "Expected an options table, but got: "..type(opts))
   if not opts.log_prefix then
