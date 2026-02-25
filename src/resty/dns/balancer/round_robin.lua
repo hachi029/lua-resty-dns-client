@@ -161,6 +161,7 @@ function _M.new(opts)
   self.maxWheelSize = opts.maxWheelSize or opts.wheelSize or MAX_WHEEL_SIZE
   self.wheel = {}
 
+  -- addHost
   for _, host in ipairs(opts.hosts or {}) do
     local new_host = type(host) == "table" and host or { name = host }
     local ok, err = self:addHost(new_host.name, new_host.port, new_host.weight)

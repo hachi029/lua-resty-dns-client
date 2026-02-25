@@ -159,6 +159,7 @@ local string_format = string.format
 local ngx_log = ngx.log
 local ngx_DEBUG = ngx.DEBUG
 local ngx_WARN = ngx.WARN
+--每次创建一个balancer时，加1
 local balancer_id_counter = 0
 
 local EMPTY = setmetatable({},
@@ -440,6 +441,7 @@ local function assert_atomicity(f, self, ...)
 end
 
 
+--- 一个每秒执行一次的timer
 -- Timer invoked to update DNS records
 local function resolve_timer_callback()
   local now = time()
@@ -460,6 +462,9 @@ end
 
 
 
+--- 将host加入renewal_heap，
+--- key为host.balancer.id .. ":" .. host.hostname .. ":" .. host.port
+--- value为下次要执行dns解析的时间
 -- schedules a DNS update for a host in the global timer queue. This uses only
 -- a single timer for all balancers.
 -- IMPORTANT: this construct should not prevent GC of the Host object
@@ -496,14 +501,15 @@ local function cancel_dns_renewal(host)
   renewal_heap:remove(key)
 end
 
--- 根据dns解析结果，更新host的address
+--- 根据dns解析结果，更新host的address。
+-- self为objHost, newQuery 为域名解析结果；dns为dns解析客户端
 local function update_dns_result(self, newQuery, dns)
   local oldQuery = self.lastQuery or {}
   local oldSorted = self.lastSorted or {}
 
   -- we're using the dns' own cache to check for changes.
   -- if our previous result is the same table as the current result, then nothing changed
-  if oldQuery == newQuery then    ---1.和上次解析结果相同
+  if oldQuery == newQuery then    ---1.和上次解析结果相同。(如缓存命中)
     ngx_log(ngx_DEBUG, self.log_prefix, "no dns changes detected for ", self.hostname)
 
     return true    -- exit, nothing changed
@@ -527,6 +533,7 @@ local function update_dns_result(self, newQuery, dns)
     if oldQuery.__ttl0Flag then           ---2.1 处理边界条件
       -- still ttl 0 so nothing changed
       oldQuery.touched = time()
+      --- ttl0的记录缓存时长 self.balancer.ttl0Interval
       oldQuery.expire = oldQuery.touched + self.balancer.ttl0Interval
       ngx_log(ngx_DEBUG, self.log_prefix, "no dns changes detected for ",
               self.hostname, ", still using ttl=0")
@@ -546,7 +553,7 @@ local function update_dns_result(self, newQuery, dns)
           priority = 1,
           ttl = self.balancer.ttl0Interval,
         },
-        expire = time() + self.balancer.ttl0Interval,
+        expire = time() + self.balancer.ttl0Interval, -- 默认60秒
         touched = time(),
         __ttl0Flag = true,        -- flag marking this record as a fake SRV one
       }
@@ -565,7 +572,7 @@ local function update_dns_result(self, newQuery, dns)
   local newSorted = sorts[rtype](newQuery)  --根据不同的记录类型执行不同的排序逻辑
   local dirty
 
-  if rtype ~= (oldSorted[1] or EMPTY).type then ---3.新解析结果与本次解析结果记录类型不一样
+  if rtype ~= (oldSorted[1] or EMPTY).type then ---3.新解析结果与本次解析结果  记录类型  不一样
     -- DNS recordtype changed; recycle everything
     ngx_log(ngx_DEBUG, self.log_prefix, "dns record type changed for ",
             self.hostname, ", ", (oldSorted[1] or EMPTY).type, " -> ",rtype)
@@ -629,7 +636,7 @@ local function update_dns_result(self, newQuery, dns)
   self.lastQuery = newQuery
   self.lastSorted = newSorted
 
-  if dirty then       --- 6. address发生了变更
+  if dirty then       --- 6. address发生了变更（新增、删除、weight变更）
     -- above we already added and updated records. Removed addresses are disabled, and
     -- need yet to be deleted from the Host
     ngx_log(ngx_DEBUG, self.log_prefix, "updating balancer based on dns changes for ",
@@ -638,6 +645,7 @@ local function update_dns_result(self, newQuery, dns)
     -- allow balancer to update its algorithm
     self.balancer:afterHostUpdate(self)     --- 6.1 更新状态
 
+    -- self为objHost
     -- delete addresses previously disabled
     self:deleteAddresses()                  ---6.2  删除被disable的address
   end
@@ -647,6 +655,7 @@ local function update_dns_result(self, newQuery, dns)
 end
 
 
+--- 执行host的dns解析
 -- Queries the DNS for this hostname. Updates the underlying address objects.
 -- This method always succeeds, but it might leave the balancer in a 0-weight
 -- state if none of the hosts resolves.
@@ -661,13 +670,16 @@ function objHost:queryDns(cacheOnly)
   -- Note: the other place we may yield would be the callbacks, who's content
   -- we do not control, hence they are executed delayed, to ascertain
   -- atomicity.
+  --- dns解析客户端
   local dns = self.balancer.dns
   local newQuery, err, try_list = dns.resolve(self.hostname, nil, cacheOnly)
 
+  -- 解析错误
   if err then
     ngx_log(ngx_WARN, self.log_prefix, "querying dns for ", self.hostname,
             " failed: ", err , ". Tried ", tostring(try_list))
 
+    -- 构建一个假的解析记录
     -- query failed, create a fake record
     -- the empty record will cause all existing addresses to be removed
     newQuery = {
@@ -677,9 +689,9 @@ function objHost:queryDns(cacheOnly)
     }
   end
 
-  assert_atomicity(update_dns_result, self, newQuery, dns)    --原子执行
+  assert_atomicity(update_dns_result, self, newQuery, dns)    ---原子执行， 更新dns解析结果
 
-  schedule_dns_renewal(self)    --加入dns更新任务列表，根据下次dns更新时间，放入renewal_heap中
+  schedule_dns_renewal(self)    ---加入dns更新任务列表，根据下次dns更新时间，放入renewal_heap中。到期后会执行self:queryDns()
 
   return true
 end

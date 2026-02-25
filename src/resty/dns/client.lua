@@ -57,6 +57,10 @@ local badTtl               -- ttl (in seconds) for a other dns error results
 local staleTtl             -- ttl (in seconds) to serve stale data (while new lookup is in progress)
 local validTtl             -- ttl (in seconds) to use to override ttl of any valid answer
 local cacheSize            -- size of the lru cache
+-- Disables synchronization between queries, resulting in each lookup for the
+-- same name being executed in it's own query to the nameservers. The default
+-- (false) will synchronize multiple queries for the same name to a single
+-- query to the nameserver.
 local noSynchronisation
 local orderValids = {"LAST", "SRV", "A", "AAAA", "CNAME"} -- default order to query
 local typeOrder            -- array with order of types to try
@@ -117,8 +121,10 @@ end
 -- Result is a list with entries.
 -- Keys only by "hostname" only contain the last succesfull lookup type
 -- for this name, see `resolve` function.
+-- 为lrucache dnscache = lrucache.new(cacheSize)
 local dnscache
 
+--- 查询缓存， ley 为查询类型+域名
 -- lookup a single entry in the cache.
 -- @param qname name to lookup
 -- @param qtype type number, any of the TYPE_xxx constants
@@ -130,6 +136,7 @@ local cachelookup = function(qname, qtype)
 
   if cached then
     cached.touch = now
+    -- 检查是否已过期
     if (cached.expire < now) then
       cached.expired = true
       --[[
@@ -157,6 +164,7 @@ local cacheinsert = function(entry, qname, qtype)
   local now = time()
   local e1 = entry[1]
 
+  -- 如果未过期
   if not entry.expire then
     -- new record not seen before
     local ttl
@@ -223,10 +231,11 @@ local cacheinsert = function(entry, qname, qtype)
     --]]
 
   else
+    -- 已过期
     -- an existing record reinserted (under a shortname for example)
     -- must calculate remaining ttl, cannot get it from lrucache
     key = (qtype or e1.type) .. ":" .. (qname or e1.name)
-    lru_ttl = entry.expire - now + staleTtl
+    lru_ttl = entry.expire - now + staleTtl -- 缓存一个已过期的记录，默认4秒
     --[[
     log(DEBUG, PREFIX, "cache set (existing): ", key, " ", frecord(entry))
     --]]
@@ -244,11 +253,13 @@ local cacheinsert = function(entry, qname, qtype)
   dnscache:set(key, entry, lru_ttl)
 end
 
+-- 查询lrucache
 -- Lookup a shortname in the cache.
 -- @param qname the name to lookup
 -- @param qtype (optional) if not given a non-type specific query is done
 -- @return same as cachelookup
 local function cacheShortLookup(qname, qtype)
+  -- key: "short:"..qname..(qtype or "none")
   return cachelookup("short:" .. qname, qtype or "none")
 end
 
@@ -339,6 +350,7 @@ local try_list_mt = {
 -- @param qtype query type being done
 -- @param status (optional) message to be recorded
 -- @return the list
+-- 向self代表的table中添加一个item {qname, qtype, status}
 local function try_add(self, qname, qtype, status)
   self = self or setmetatable({}, try_list_mt)
   local key = tostring(qname) .. ":" .. tostring(qtype)
@@ -356,6 +368,7 @@ end
 -- @param self the try_list to add to
 -- @param status string with current status, added to the list for the current try
 -- @return the try_list
+-- 设置当前try obj中status为stale
 local function try_status(self, status)
   local status_list = self[#self].msg
   status_list[#status_list + 1] = status
@@ -630,12 +643,14 @@ _M.init = function(options)
   config = options -- store it in our module level global
 
   poolMaxRetry = 1  -- do one retry, dns resolver is already doing 'retrans' number of retries on top
+  -- 最长等待dns超时时间options.timeout。options.retrans 为重试次数
   poolMaxWait = options.timeout / 1000 * options.retrans -- default is to wait for the dns resolver to hit its timeouts
 
   return true
 end
 
 
+--- 解析dns解析结果
 -- Removes non-requested results, updates the cache.
 -- Parameter `answers` is updated in-place.
 -- @return `true`
@@ -655,6 +670,7 @@ local function parseAnswer(qname, qtype, answers, try_list)
     end
   end
 
+  --- 遍历dns查询结果
   for i = #answers, 1, -1 do -- we're deleting entries, so reverse the traversal
     local answer = answers[i]
 
@@ -696,6 +712,7 @@ end
 -- @param try_list the try_list object to add to
 -- @return `result + nil + try_list`, or `nil + err + try_list` in case of errors
 local function individualQuery(qname, r_opts, try_list)
+  --- 执行查询
   local r, err = resolver:new(config)
   if not r then
     return r, "failed to create a resolver: " .. err, try_list
@@ -704,20 +721,24 @@ local function individualQuery(qname, r_opts, try_list)
   try_status(try_list, "querying")
 
   local result
+  --- 执行查询
   result, err = r:query(qname, r_opts)
   if not result then
     return result, err, try_list
   end
 
+  --- 解析查询结果，并放入缓存
   parseAnswer(qname, r_opts.qtype, result, try_list)
 
   return result, nil, try_list
 end
 
 
+--- 存放当前正在执行的dns检查任务，key为qname..qtype
 local queue = setmetatable({}, {__mode = "v"})
 -- to be called as a timer-callback, performs a query and returns the results
 -- in the `item` table.
+--- 执行dns查询
 local function executeQuery(premature, item)
   if premature then return end
 
@@ -749,6 +770,7 @@ local function executeQuery(premature, item)
   -- 1) stop new ones from adding to our lock/semaphore
   queue[item.key] = nil
   -- 2) release all waiting threads
+  --- 执行semaphore:post， 通知等待当前item的协程，任务执行完成
   item.semaphore:post(math_max(item.semaphore:count() * -1, 1))
   item.semaphore = nil
 end
@@ -763,9 +785,11 @@ end
 -- `semaphore` field that can be used to wait for completion (once complete
 -- the `semaphore` field will be removed). Upon error it returns `nil+error`.
 local function asyncQuery(qname, r_opts, try_list)
+  --- 1. 再次检查是否已经存在查询了
   local key = qname..":"..r_opts.qtype
   local item = queue[key]
   if item then
+    --- 1.1 存在则返回
     --[[
     log(DEBUG, PREFIX, "Query async (exists): ", key, " ", fquery(item))
     --]]
@@ -773,6 +797,7 @@ local function asyncQuery(qname, r_opts, try_list)
     return item    -- already in progress, return existing query
   end
 
+  --- 2. 不存在，创建一个新的item, 放入queue中
   item = {
     key = key,
     semaphore = semaphore(),
@@ -782,6 +807,7 @@ local function asyncQuery(qname, r_opts, try_list)
   }
   queue[key] = item
 
+  --- 提交一个查询任务
   local ok, err = timer_at(0, executeQuery, item)
   if not ok then
     queue[key] = nil
@@ -797,6 +823,7 @@ local function asyncQuery(qname, r_opts, try_list)
 end
 
 
+--- 执行dns查询，会先查看是否有正在进行中的查询，如果有，则
 -- schedules a sync query.
 -- This will be synchronized, so multiple calls (sync or async) might result in 1 query.
 -- The `poolMaxWait` is how long a thread waits for another to complete the query.
@@ -808,12 +835,13 @@ end
 -- @return `result + nil + try_list`, or `nil + err + try_list` in case of errors
 local function syncQuery(qname, r_opts, try_list, count)
   local key = qname..":"..r_opts.qtype
-  local item = queue[key]   --查看是否有正在执行中的查询
-  count = count or 1
+  local item = queue[key]   --- 1.查看是否有正在执行中的查询
+  count = count or 1    --- syncQuery会进行递归重试，count记录重试次数
 
   -- if nothing is in progress, we start a new async query
-  if not item then
+  if not item then --- 1.1没有正在执行中的查询
     local err
+    --- 1.1.1 执行查询，返回的item中有个 semaphore, 需调用semaphore:wait等待结果
     item, err = asyncQuery(qname, r_opts, try_list)
     --[[
     log(DEBUG, PREFIX, "Query sync (new): ", key, " ", fquery(item)," count=", count)
@@ -825,9 +853,11 @@ local function syncQuery(qname, r_opts, try_list, count)
     --[[
     log(DEBUG, PREFIX, "Query sync (exists): ", key, " ", fquery(item)," count=", count)
     --]]
+    --- 1.2有正在执行中的查询
     try_status(try_list, "in progress (sync)")
   end
 
+  --- 2. 判断当前阶段是否允许使用semaphore进行wait
   local supported_semaphore_wait_phases = {
     rewrite = true,
     access = true,
@@ -839,6 +869,7 @@ local function syncQuery(qname, r_opts, try_list, count)
 
   local ngx_phase = get_phase()
 
+  --- 2.1 如果不支持wait
   if not supported_semaphore_wait_phases[ngx_phase] then
     -- phase not supported by `semaphore:wait`
     -- return existing query (item)
@@ -849,9 +880,11 @@ local function syncQuery(qname, r_opts, try_list, count)
     return item, nil, try_list
   end
 
+  --- 2.2 支持wait, 则等待
   -- block and wait for the async query to complete
   local ok, err = item.semaphore:wait(poolMaxWait)
   if ok and item.result then
+    --- 2.2.1等到了
     -- we were released, and have a query result from the
     -- other thread, so all is well, return it
     --[[
@@ -861,9 +894,11 @@ local function syncQuery(qname, r_opts, try_list, count)
     return item.result, item.err, try_list
   end
 
+  --- 2.2.2超时了
   -- there was an error, either a semaphore timeout, or a lookup error
   -- go retry
   try_status(try_list, "try "..count.." error: "..(item.err or err or "unknown"))
+  --- 超时返回
   if count > poolMaxRetry then
     --[[
     log(DEBUG, PREFIX, "Query sync (fail): ", key, " ", fquery(item)," retries exceeded. count=", count)
@@ -879,6 +914,7 @@ local function syncQuery(qname, r_opts, try_list, count)
   --[[
   log(DEBUG, PREFIX, "Query sync (fail): ", key, " ", fquery(item)," retrying. count=", count)
   --]]
+  --- 3.重试
   return syncQuery(qname, r_opts, try_list, count + 1)
 end
 
@@ -892,11 +928,13 @@ end
 -- data. In that case an error is returned (as a dns server failure table).
 -- @param try_list the try_list object to add to
 -- @return `entry + nil + try_list`, or `nil + err + try_list`
+---
 local function lookup(qname, r_opts, dnsCacheOnly, try_list)
+  --- 1 先查询缓存
   local entry = cachelookup(qname, r_opts.qtype)
   if not entry then
     --not found in cache
-    if dnsCacheOnly then
+    if dnsCacheOnly then    -- 直接返回
       -- we can't do a lookup, so return an error
       --[[
       log(DEBUG, PREFIX, "Lookup, cache only failure: ", qname, " = ", r_opts.qtype)
@@ -909,9 +947,12 @@ local function lookup(qname, r_opts, dnsCacheOnly, try_list)
     end
     -- perform a sync lookup, as we have no stale data to fall back to
     try_list = try_add(try_list, qname, r_opts.qtype, "cache-miss")
+    -- noSynchronisation 判断是否允许同时执行针对同一域名的并发执行。默认为不允许
     if noSynchronisation then
+      -- 允许
       return individualQuery(qname, r_opts, try_list)
     end
+    -- 不允许
     return syncQuery(qname, r_opts, try_list)
   end
 
@@ -931,6 +972,7 @@ end
 -- @param qtype query type performed, any of the `TYPE_xx` constants
 -- @param try_list the try_list object to add to
 -- @return record as cached, nil, try_list
+-- 直接将ipv6封装为一条dns解析结果记录，放入本地的lrucache中，然后返回
 local function check_ipv6(qname, qtype, try_list)
   try_list = try_add(try_list, qname, qtype, "IPv6")
 
@@ -984,6 +1026,7 @@ end
 -- @param qtype query type performed, any of the `TYPE_xx` constants
 -- @param try_list the try_list object to add to
 -- @return record as cached, nil, try_list
+--- 直接将ipv4封装为一条dns解析结果记录，加入到lrucache中
 local function check_ipv4(qname, qtype, try_list)
   try_list = try_add(try_list, qname, qtype, "IPv4")
 
@@ -1130,6 +1173,7 @@ local function resolve(qname, r_opts, dnsCacheOnly, try_list)
   local err, records
 
   local opts = {}
+  -- 如果 r_opts 不为nil, 将其和opts合并
   if r_opts then
     for k,v in pairs(r_opts) do opts[k] = v end  -- copy the options table
   else
@@ -1142,9 +1186,10 @@ local function resolve(qname, r_opts, dnsCacheOnly, try_list)
   -- we do this only to prevent iterating over the SEARCH directive and
   -- potentially requerying failed lookups in that process as the ttl for
   -- errors is relatively short (1 second default)
-  records = cacheShortLookup(qname, qtype)    ---1. 从dnscache中查询
+  records = cacheShortLookup(qname, qtype)    ---1. 从本地的lrucache dnscache中查询
+  --- 1.1 查询到了缓存
   if records then
-    if try_list then
+    if try_list then  -- 首次为nil
       -- check for recursion
       if try_list["(short)"..qname..":"..tostring(qtype)] then
         -- luacheck: push no unused
@@ -1156,53 +1201,68 @@ local function resolve(qname, r_opts, dnsCacheOnly, try_list)
       end
     end
 
+    -- 往 try_list 中添加一项
     try_list = try_add(try_list, "(short)"..qname, qtype, "cache-hit")
+    -- 如果记录已经过期
     if records.expired then
       -- if the record is already stale/expired we have to traverse the
       -- iterator as that is required to start the async refresh queries
       -- luacheck: push no unused
       records = nil
       -- luacheck: pop
+      -- 设置当前try obj中status为stale
       try_list = try_status(try_list, "stale")
 
     else
       -- a valid non-stale record
       -- check for CNAME records, and dereferencing the CNAME
+      --- 未过期，如果记录类型是cname,但要查询类型不是cname，则继续解析cname
       if (records[1] or EMPTY).type == _M.TYPE_CNAME and qtype ~= _M.TYPE_CNAME then
         opts.qtype = nil
         try_status(try_list, "dereferencing")
+        --- 递归查询cname的记录
         return resolve(records[1].cname, opts, dnsCacheOnly, try_list)
       end
 
+      -- 返回
       -- return the shortname cache hit
       return records, nil, try_list
     end
   else
+    -- 1.2 本地lrucache未命中
     try_list = try_add(try_list, "(short)"..qname, qtype, "cache-miss")
   end
 
+  --- 2. 上一步查询本地缓存未命中，开始执行dns查询
   -- check for qname being an ip address
+  -- 判断name的类型 ipv4 or ipv6 or name
   local name_type = utils.hostnameType(qname)
-  if name_type ~= "name" then       --- 2. 查询的不是一个域名，是一个ipv4或ipv6
+  if name_type ~= "name" then       --- 2.1. 查询的不是一个域名，是一个ipv4或ipv6
     if name_type == "ipv4" then
       -- if no qtype is given, we're supposed to search, so forcing TYPE_A is safe
+      -- 直接将ipv4封装为一条dns解析结果记录，放入本地的lrucache中，然后返回
       records, _, try_list = check_ipv4(qname, qtype or _M.TYPE_A, try_list)
     else
 
       -- it is 'ipv6'
       -- if no qtype is given, we're supposed to search, so forcing TYPE_AAAA is safe
+      -- 直接将ipv6封装为一条dns解析结果记录，放入本地的lrucache中，然后返回
       records, _, try_list = check_ipv6(qname, qtype or _M.TYPE_AAAA, try_list)
     end
 
+    -- 上一步中check_ipv4或check_ipv6有错误
     if records.errcode then
       -- the query type didn't match the ip address, or a bad ip address
       return nil,
              ("dns server error: %s %s"):format(records.errcode, records.errstr),
              try_list
     end
+    -- 正常的逻辑
     -- valid ipv4 or ipv6
     return records, nil, try_list
   end
+
+  --- 2.2 查询的是一个域名
 
   -- go try a sequence of record types
   for try_name, try_type in search_iter(qname, qtype) do
@@ -1214,6 +1274,7 @@ local function resolve(qname, r_opts, dnsCacheOnly, try_list)
     else
       -- go look it up
       opts.qtype = try_type
+      --- 2.2.1执行dns查询
       records, err, try_list = lookup(try_name, opts, dnsCacheOnly, try_list)
     end
 
@@ -1236,6 +1297,7 @@ local function resolve(qname, r_opts, dnsCacheOnly, try_list)
       -- luacheck: pop
 
     else
+      --- 2.2.2 此处说明dns解析成功
       -- we got some records, update the cache
       if not dnsCacheOnly then
         if not qtype then
@@ -1274,6 +1336,7 @@ local function resolve(qname, r_opts, dnsCacheOnly, try_list)
           cacheShortInsert(records, qname, qtype)
         end
 
+        --- 解析cname
         -- check if we need to dereference a CNAME
         if records[1].type == _M.TYPE_CNAME and qtype ~= _M.TYPE_CNAME then
           -- dereference CNAME
